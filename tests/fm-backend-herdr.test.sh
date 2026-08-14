@@ -4034,6 +4034,8 @@ case "$cmd $sub" in
   "session list")
     printf '{"sessions":[{"name":"%s","running":true,"default":false,"socket_path":"%s"}]}\n' \
       "${FM_FAKE_SESSION_NAME:-default}" "${FM_FAKE_SOCKET:-/tmp/fm-fake.sock}" ;;
+  "api schema")
+    [ -n "${FM_FAKE_SCHEMA_FILE:-}" ] && cat "$FM_FAKE_SCHEMA_FILE" ;;
   "agent get")
     if [ -n "${FM_FAKE_READER_READY_FILE:-}" ] && [ ! -e "$FM_FAKE_READER_READY_FILE" ]; then
       exit 9
@@ -4163,6 +4165,43 @@ test_apply_transition_defer_and_fallback_are_noops() {
     [ ! -e "$marker" ] || fail "defer/fallback status '$s' must not touch the escalation marker"
   done
   pass "fm_backend_herdr_apply_transition: idle/done (defer) and unknown/empty (fallback) take no fast action"
+}
+
+test_events_capable_large_schema_no_broken_pipe() {
+  local dir fb schema err rc
+  dir="$TMP_ROOT/events-capable-large-schema"; mkdir -p "$dir"
+  fb=$(make_herdr_eventfake "$dir")
+  schema="$dir/schema.json"
+  # A real `herdr api schema --json` payload is ~220KB (2026-08-14 incident:
+  # `printf '%s' "$schema" | grep -Fq ...` reliably logged a "write error:
+  # Broken pipe" against the real binary, since grep -q can close its stdin
+  # before printf finishes writing a payload this size). Pad well past that so
+  # this stays a meaningful size check even though the fix (in-shell `case`
+  # matching, no subprocess/pipe at all) cannot SIGPIPE regardless of size.
+  { printf '{"methods":['
+    yes '"padding.method"' | head -20000 | tr '\n' ','
+    printf '"events.subscribe","pane.agent_status_changed"]}'
+  } > "$schema"
+  err="$dir/err.log"
+  rc=$(PATH="$fb:$PATH" FM_FAKE_SCHEMA_FILE="$schema" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_events_capable default; echo $?' \
+    "$ROOT" 2>"$err")
+  [ "$rc" = 0 ] || fail "events_capable must report capable when both required methods are present, got $rc"
+  [ ! -s "$err" ] || fail "events_capable must not leak a broken-pipe write error onto stderr: $(cat "$err")"
+  pass "fm_backend_herdr_events_capable: a large schema with both methods is capable, with no subprocess pipe to SIGPIPE"
+}
+
+test_events_capable_missing_method_is_incapable() {
+  local dir fb schema rc
+  dir="$TMP_ROOT/events-capable-missing-method"; mkdir -p "$dir"
+  fb=$(make_herdr_eventfake "$dir")
+  schema="$dir/schema.json"
+  printf '{"methods":["events.subscribe"]}' > "$schema"
+  rc=$(PATH="$fb:$PATH" FM_FAKE_SCHEMA_FILE="$schema" \
+    bash -c '. "$0/bin/backends/herdr.sh"; fm_backend_herdr_events_capable default; echo $?' \
+    "$ROOT")
+  [ "$rc" = 1 ] || fail "events_capable must report incapable when pane.agent_status_changed is absent, got $rc"
+  pass "fm_backend_herdr_events_capable: a schema missing either required method is incapable"
 }
 
 test_wait_transition_no_panes_returns_2() {
@@ -4480,6 +4519,8 @@ test_apply_transition_blocked_requires_commit_to_dedupe
 test_apply_transition_working_clears_marker
 test_clear_transition_removes_task_marker
 test_apply_transition_defer_and_fallback_are_noops
+test_events_capable_large_schema_no_broken_pipe
+test_events_capable_missing_method_is_incapable
 test_wait_transition_no_panes_returns_2
 test_wait_transition_not_capable_returns_2
 test_wait_transition_reconcile_blocked_returns_record

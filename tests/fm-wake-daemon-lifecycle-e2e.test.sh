@@ -167,5 +167,67 @@ test_stale_pane_transient_persistent_resume() {
   pass "lifecycle: stale pane transient self-handles, persistent escalates once and clears, resumed clears quietly"
 }
 
+# --- Phase 3: a watcher that repeats the identical wake gets throttled -------
+# 2026-08-14 incident: a watcher whose recovery-marker episode never gets
+# consumed (report: bin/fm-watch.sh's resurface_after_downtime) can report the
+# SAME "check: rearm-resurface" wake on every restart. That exit is not a
+# crash (rc=0, non-empty reason), so the restart loop applied NO backoff at
+# all and the real daemon logged over a thousand consecutive restarts within
+# minutes. This drives the REAL fm-supervise-daemon.sh against a trivial
+# scripted watcher (FM_SUPERVISE_DAEMON_WATCH_OVERRIDE) that always reports the
+# identical reason, and asserts the restart count over several seconds stays
+# small (the repeated-wake backoff engaged) instead of racing unboundedly.
+test_repeated_wake_gets_throttled() {
+  local dir fakebin state fake_watch daemon_pid log
+  dir=$(make_supercase wd-repeat-throttle)
+  fakebin="$dir/fakebin"; mkdir -p "$fakebin"
+  state="$dir/state"; mkdir -p "$state"
+  log="$state/.supervise-daemon.log"
+
+  # A minimal tmux stub: only fm_backend_target_exists's `display-message`
+  # probe is exercised by the daemon's pane-gone guard; answer it and nothing
+  # else (the fake watcher never touches tmux itself).
+  cat > "$fakebin/tmux" <<'SH'
+#!/usr/bin/env bash
+case "${1:-} ${2:-}" in
+  "display-message -p") printf 'fake-pane-id\n'; exit 0 ;;
+esac
+exit 1
+SH
+  chmod +x "$fakebin/tmux"
+
+  fake_watch="$dir/fake-watch.sh"
+  cat > "$fake_watch" <<'SH'
+#!/usr/bin/env bash
+printf 'check: fake-repeat\n'
+SH
+  chmod +x "$fake_watch"
+
+  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" \
+    FM_SUPERVISE_DAEMON_WATCH_OVERRIDE="$fake_watch" \
+    FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=fake:0 \
+    FM_CRASH_NORMAL_SLEEP=1 FM_CRASH_THRESHOLD=1 FM_CRASH_WINDOW=60 FM_CRASH_BACKOFF=4 \
+    FM_HOUSEKEEPING_TICK=999999 \
+    "$DAEMON" > "$dir/daemon.out" 2> "$dir/daemon.err" &
+  daemon_pid=$!
+
+  sleep 12
+  kill -TERM "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+
+  [ -f "$log" ] || fail "repeated-wake throttle: daemon produced no log ($(cat "$dir/daemon.err" 2>/dev/null))"
+  local wakes
+  wakes=$(grep -c '^\[.*\] wake: check: fake-repeat$' "$log")
+  # No-backoff-at-all would restart as fast as the OS can fork+exec a trivial
+  # script - hundreds of times in 9s. The repeated-wake guard's own backoff
+  # schedule (1s, 1s, then 4s once the threshold trips) bounds it to a handful.
+  [ "$wakes" -ge 2 ] || fail "repeated-wake throttle: expected the fake watcher to restart at least twice, got $wakes ($(cat "$log"))"
+  [ "$wakes" -le 10 ] || fail "repeated-wake throttle: restarted $wakes times in 9s with no observable backoff ($(cat "$log"))"
+  grep -q "ERROR: watcher repeated the identical wake" "$log" \
+    || fail "repeated-wake throttle: crossing the threshold did not log the escalated backoff ($(cat "$log"))"
+  pass "lifecycle: a watcher repeating the identical wake is throttled, not restarted in a tight loop"
+}
+
 test_routine_then_terminal_after_restart
 test_stale_pane_transient_persistent_resume
+test_repeated_wake_gets_throttled

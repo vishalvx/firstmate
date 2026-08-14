@@ -1342,7 +1342,10 @@ fm_super_main() {
   # shellcheck source=bin/fm-wake-lib.sh
   FM_STATE_OVERRIDE="$STATE" . "$FM_DAEMON_DIR/fm-wake-lib.sh"
 
-  local WATCH="$FM_DAEMON_DIR/fm-watch.sh"
+  # Override only for tests: lets a test drive the restart loop's own timing
+  # and backoff logic against a trivial scripted watcher, without needing a
+  # real herdr/tmux session to force a specific wake sequence deterministically.
+  local WATCH="${FM_SUPERVISE_DAEMON_WATCH_OVERRIDE:-$FM_DAEMON_DIR/fm-watch.sh}"
   local LOG="$STATE/.supervise-daemon.log"
   local WATCH_ERR="$STATE/.supervise-daemon.watcher.err"
   local LOCK="$STATE/.supervise-daemon.lock"
@@ -1486,6 +1489,35 @@ fm_super_main() {
     fi
   }
 
+  # --- repeated-wake guard ---------------------------------------------------
+  # A watcher that exits cleanly (rc=0, non-empty reason) is not a crash, so it
+  # restarts with no backoff at all above. That is correct for normal, varied
+  # fleet traffic, but a watcher that reports the IDENTICAL reason on every
+  # restart (e.g. an unconsumed recovery-marker episode kept alive by ongoing
+  # wake-queue traffic) can repeat hundreds of times a minute with zero
+  # throttling, each one a captain-facing escalation. Track consecutive
+  # occurrences of the same reason separately from crash_times, reusing the
+  # identical threshold/window/backoff shape, so the log wording stays accurate
+  # (this is not a crash) while the throttling behavior matches.
+  local repeat_times=() repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason=
+  record_repeated_wake() {
+    local now t
+    now=$(_now)
+    local -a keep=()
+    for t in "${repeat_times[@]:-}"; do
+      [ -n "$t" ] && [ $((now - t)) -lt "$CRASH_WINDOW" ] && keep+=("$t")
+    done
+    keep+=("$now")
+    repeat_times=("${keep[@]}")
+    if [ "${#repeat_times[@]}" -gt "$CRASH_THRESHOLD" ]; then
+      log "ERROR: watcher repeated the identical wake ('$last_wake_reason') ${#repeat_times[@]} times within ${CRASH_WINDOW}s; backing off ${CRASH_BACKOFF}s"
+      repeat_times=()
+      repeat_backoff_secs=$CRASH_BACKOFF
+    else
+      repeat_backoff_secs=$CRASH_NORMAL_SLEEP
+    fi
+  }
+
   start_watcher() {
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
     "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
@@ -1543,6 +1575,14 @@ fm_super_main() {
           log "durable wake handling was not acknowledged; restarting for recovery"
         fi
         trim_log
+        if [ "$reason" = "$last_wake_reason" ]; then
+          record_repeated_wake
+          sleep "$repeat_backoff_secs"
+        else
+          repeat_times=()
+          repeat_backoff_secs=$CRASH_NORMAL_SLEEP
+        fi
+        last_wake_reason=$reason
       fi
       start_watcher || continue
     fi
