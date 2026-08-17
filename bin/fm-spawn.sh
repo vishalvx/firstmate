@@ -1729,6 +1729,12 @@ validate_spawn_worktree() {  # <source> <inspect-target>
 
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
+  # A genuinely local-only project has no origin to freshen against at all,
+  # distinct from a configured-but-unreachable origin: only the former is
+  # "nothing to do", the latter must keep refusing below.
+  if ! git -C "$worktree" remote get-url origin >/dev/null 2>&1; then
+    return 0
+  fi
   if ! git -C "$worktree" fetch --quiet origin; then
     echo "error: could not fetch origin for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
     return 1

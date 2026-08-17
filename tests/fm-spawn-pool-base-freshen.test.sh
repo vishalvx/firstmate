@@ -73,6 +73,29 @@ $1
 EOF
 }
 
+make_no_remote_case() {
+  local name=$1 id=$2 default=${3:-main} case_dir home project pool fakebin initial
+  case_dir="$TMP_ROOT/$name"
+  home="$case_dir/home"
+  project="$case_dir/project"
+  pool="$case_dir/pool"
+  fakebin=$(make_spawn_fakebin "$case_dir/fake")
+
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
+  printf 'codex\n' > "$home/config/crew-harness"
+  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  touch "$home/state/.last-watcher-beat"
+
+  git init --quiet -b "$default" "$project"
+  printf 'base\n' > "$project/README.md"
+  git -C "$project" add README.md
+  git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
+  initial=$(git -C "$project" rev-parse HEAD)
+  git -C "$project" worktree add --quiet --detach "$pool" "$initial"
+
+  printf '%s\n' "$case_dir|$home|$project|$pool|$fakebin|$initial|$default"
+}
+
 run_spawn() {
   local id=$1
   shift
@@ -227,11 +250,34 @@ test_unresolved_remote_default_refuses_pool() {
   pass "an unresolved remote default branch refuses the pooled worktree"
 }
 
+test_no_remote_project_skips_freshen_cleanly() {
+  local rec id out status remotes before after
+  id='pool-no-remote-r6'
+  rec=$(make_no_remote_case no-remote "$id")
+  read_case_record "$rec"
+  remotes=$(git -C "$POOL_DIR" remote -v)
+  [ -z "$remotes" ] || fail "fixture did not prove the pooled worktree has no configured remote"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  expect_code 0 "$status" "spawn should not require an origin for a genuinely local-only project"
+  assert_contains "$out" "spawned $id" "spawn did not report success for a no-remote project"
+  after=$(git -C "$POOL_DIR" rev-parse HEAD)
+  [ "$after" = "$before" ] \
+    || fail "spawn moved a no-remote pooled worktree's history when there was nothing to fetch"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote spawn: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a genuinely local-only project with no configured remote skips the freshen step cleanly"
+}
+
 test_stale_pool_base_refreshes_before_branching
 test_non_main_default_branch_refreshes_before_branching
 test_direct_pr_and_scout_refresh_before_launch
 test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool
 test_unreachable_origin_refuses_stale_pool_base
+test_no_remote_project_skips_freshen_cleanly
 
 echo "# all fm-spawn-pool-base-freshen tests passed"
