@@ -181,13 +181,14 @@ test_stale_pane_transient_persistent_resume() {
 # identical reason, and asserts the observable throttle: once the repeat
 # threshold is crossed, two consecutive wakes must be spaced by at least
 # FM_CRASH_BACKOFF.
-test_repeated_wake_gets_throttled() {
-  local dir fakebin state fake_watch daemon_pid log
-  dir=$(make_supercase wd-repeat-throttle)
-  fakebin="$dir/fakebin"
-  state="$dir/state"
-  log="$state/.supervise-daemon.log"
-
+# Launch the real daemon against a scripted watcher that always reports the same
+# wake reason. Echoes "<case dir>|<log path>|<daemon pid>"; the caller supplies
+# the FM_CRASH_* values as leading NAME=VALUE arguments, because the two tests
+# below need different ones to isolate different halves of the guard.
+start_repeat_wake_daemon() {  # <case-name> <FM_CRASH_* assignments...>
+  local name=$1 dir fake_watch daemon_pid
+  shift
+  dir=$(make_supercase "$name")
   fake_watch="$dir/fake-watch.sh"
   cat > "$fake_watch" <<'SH'
 #!/usr/bin/env bash
@@ -195,29 +196,65 @@ printf 'check: fake-repeat\n'
 SH
   chmod +x "$fake_watch"
 
-  PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" \
+  PATH="$dir/fakebin:$PATH" FM_STATE_OVERRIDE="$dir/state" \
     FM_SUPERVISE_DAEMON_WATCH_OVERRIDE="$fake_watch" \
     FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=fake:0 FM_FAKE_TMUX_PANE_ALIVE=1 \
-    FM_CRASH_NORMAL_SLEEP=1 FM_CRASH_THRESHOLD=1 FM_CRASH_WINDOW=60 FM_CRASH_BACKOFF=8 \
     FM_HOUSEKEEPING_TICK=999999 \
-    "$DAEMON" > "$dir/daemon.out" 2> "$dir/daemon.err" &
+    env "$@" "$DAEMON" > "$dir/daemon.out" 2> "$dir/daemon.err" &
   daemon_pid=$!
+  printf '%s|%s|%s\n' "$dir" "$dir/state/.supervise-daemon.log" "$daemon_pid"
+}
 
-  sleep 24
+# Seconds-since-midnight of the Nth line matching an extended regex in the log,
+# so a test can measure real spacing between two logged events.
+log_line_seconds() {  # <log> <ere> <index>
+  awk -v want="$3" -F'T' '$0 ~ ere {
+      n += 1
+      if (n == want) {
+        split(substr($2, 1, 8), c, ":")
+        print c[1] * 3600 + c[2] * 60 + c[3]
+        exit
+      }
+    }' ere="$2" "$1"
+}
+
+test_repeated_wake_gets_throttled() {
+  local rec dir log daemon_pid
+  rec=$(start_repeat_wake_daemon wd-repeat-throttle \
+    FM_CRASH_NORMAL_SLEEP=1 FM_CRASH_THRESHOLD=1 FM_CRASH_WINDOW=60 FM_CRASH_BACKOFF=8)
+  IFS='|' read -r dir log daemon_pid <<EOF
+$rec
+EOF
+
+  # Wait for the 4th wake rather than a fixed observation window. With the guard
+  # the 4th wake is the first one that lands AFTER the threshold trips, so it is
+  # exactly the evidence the gap assertion needs; a fixed window instead has to
+  # bet that the per-wake drain round trips stay cheap enough for it to arrive,
+  # and fails against correct code on a loaded machine when they do not. Without
+  # the guard the 4th wake arrives in well under 15s, so this waits no longer
+  # against unpatched code - it just ends up measuring ~3s gaps and failing on
+  # the assertions below, which is the point.
+  local wakes widest deadline
+  wakes=0
+  deadline=$(( $(date +%s) + 90 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ -f "$log" ]; then
+      wakes=$(grep -c '^\[.*\] wake: check: fake-repeat$' "$log")
+      [ "$wakes" -ge 4 ] && break
+    fi
+    sleep 1
+  done
   kill -TERM "$daemon_pid" 2>/dev/null || true
   wait "$daemon_pid" 2>/dev/null || true
 
   [ -f "$log" ] || fail "repeated-wake throttle: daemon produced no log ($(cat "$dir/daemon.err" 2>/dev/null))"
-  local wakes widest
-  wakes=$(grep -c '^\[.*\] wake: check: fake-repeat$' "$log")
   # The unthrottled cadence is NOT a bare fork+exec: every wake also runs the
   # durable-wake drain, so unpatched restarts land ~2-3s apart and a raw count
-  # over this window barely separates the two behaviors. The gap does: the
-  # widest interval between consecutive wakes is ~3s without the guard, and at
-  # least FM_CRASH_BACKOFF (8s) once the repeat threshold trips. Sleeps only
-  # ever widen gaps, so a loaded machine cannot push this below the bound.
-  [ "$wakes" -ge 3 ] || fail "repeated-wake throttle: expected the fake watcher to restart past the repeat threshold, got $wakes wakes ($(cat "$log"))"
-  [ "$wakes" -le 8 ] || fail "repeated-wake throttle: restarted $wakes times in 24s, at the unthrottled rate ($(cat "$log"))"
+  # never separates the two behaviors. The gap does: the widest interval between
+  # consecutive wakes is ~3s without the guard, and at least FM_CRASH_BACKOFF
+  # (8s) once the repeat threshold trips. Sleeps only ever widen gaps, so a
+  # loaded machine cannot push this below the bound.
+  [ "$wakes" -ge 4 ] || fail "repeated-wake throttle: expected the fake watcher to restart past the repeat threshold, got $wakes wakes ($(cat "$log"))"
   widest=$(awk -F'T' '/\] wake: check: fake-repeat$/ {
       split(substr($2, 1, 8), c, ":")
       now = c[1] * 3600 + c[2] * 60 + c[3]
@@ -230,6 +267,51 @@ SH
   pass "lifecycle: a watcher repeating the identical wake is throttled, not restarted in a tight loop"
 }
 
+# The escalated tier has to stay reachable when each restart already costs more
+# than FM_CRASH_WINDOW / FM_CRASH_THRESHOLD - which is the shipped configuration:
+# a restart costs at least FM_CRASH_NORMAL_SLEEP (5s) plus the loop's own 1s
+# poll, against a 60s window and a threshold of 10, i.e. exactly 6s of budget per
+# event. Counting how many events landed inside a sliding window cannot cross a
+# threshold under that ratio - the count saturates one short of it forever - so
+# the guard's ERROR line and long backoff would never fire in production even
+# though the daemon really is spinning. These values reproduce that ratio in
+# miniature (4s + 1s per restart against a 20s window and a threshold of 5) and
+# assert the tier still fires, and that it took a streak longer than the whole
+# window to get there.
+test_repeat_backoff_reachable_when_restarts_outpace_the_window() {
+  local rec dir log daemon_pid deadline first_repeat_at tripped_at spanned
+  rec=$(start_repeat_wake_daemon wd-repeat-slow-restart \
+    FM_CRASH_NORMAL_SLEEP=4 FM_CRASH_THRESHOLD=5 FM_CRASH_WINDOW=20 FM_CRASH_BACKOFF=10)
+  IFS='|' read -r dir log daemon_pid <<EOF
+$rec
+EOF
+
+  deadline=$(( $(date +%s) + 120 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    grep -q "ERROR: watcher repeated the identical wake" "$log" 2>/dev/null && break
+    sleep 1
+  done
+  kill -TERM "$daemon_pid" 2>/dev/null || true
+  wait "$daemon_pid" 2>/dev/null || true
+
+  [ -f "$log" ] || fail "slow repeat backoff: daemon produced no log ($(cat "$dir/daemon.err" 2>/dev/null))"
+  grep -q "ERROR: watcher repeated the identical wake" "$log" \
+    || fail "slow repeat backoff: restarts spaced past FM_CRASH_WINDOW/FM_CRASH_THRESHOLD never crossed the threshold ($(cat "$log"))"
+  # The second wake is the first repeat, so it opens the streak. Reaching the
+  # trip from there must have taken longer than the whole 20s window; a count
+  # over a sliding window of that length could not have survived the trip.
+  first_repeat_at=$(log_line_seconds "$log" '\] wake: check: fake-repeat$' 2)
+  tripped_at=$(log_line_seconds "$log" 'ERROR: watcher repeated the identical wake' 1)
+  [ -n "$first_repeat_at" ] && [ -n "$tripped_at" ] \
+    || fail "slow repeat backoff: could not time the streak from the log ($(cat "$log"))"
+  spanned=$(( tripped_at - first_repeat_at ))
+  [ "$spanned" -ge 0 ] || spanned=$(( spanned + 86400 ))
+  [ "$spanned" -ge 20 ] \
+    || fail "slow repeat backoff: the streak spanned only ${spanned}s, inside the 20s window, so restarts were not slow enough to reproduce the shipped ratio ($(cat "$log"))"
+  pass "lifecycle: the repeated-wake backoff still fires when restarts are slower than the window allows per event"
+}
+
 test_routine_then_terminal_after_restart
 test_stale_pane_transient_persistent_resume
 test_repeated_wake_gets_throttled
+test_repeat_backoff_reachable_when_restarts_outpace_the_window

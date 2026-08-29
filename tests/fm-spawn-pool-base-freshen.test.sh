@@ -4,9 +4,9 @@
 # A treehouse pool can return a clean detached worktree whose origin/main was
 # advanced after the worktree was allocated.
 # These tests drive the real spawn path with a fake terminal, then prove it
-# starts the worker from the fetched origin/main tip, skips the fetch (but not
-# the clean check) when no origin is configured, or stops when origin is
-# unreachable.
+# starts the worker from the fetched origin/main tip, falls back to the local
+# default-branch tip (skipping only the remote round trip, never the clean
+# check) when no origin is configured, or stops when origin is unreachable.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -258,6 +258,42 @@ test_no_remote_project_skips_freshen_cleanly() {
     printf '# observed no-remote spawn: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
   fi
   pass "a genuinely local-only project with no configured remote skips the freshen step cleanly"
+}
+
+# Skipping the fetch must not skip base freshness either. A pool can hand back a
+# slot allocated several commits ago, and for a local-only project the
+# authoritative tip is simply the local default branch of the repository the slot
+# is a worktree of - reachable with no remote at all. A worker that branched off
+# the slot's old commit would merge back from stale history, which is the exact
+# failure the origin path's refusals exist to prevent.
+test_no_remote_stale_pool_refreshes_to_local_default() {
+  local rec id out status advanced branch_head
+  id='pool-no-remote-stale-r8'
+  rec=$(make_case no-remote-stale "$id" main no-origin)
+  read_case_record "$rec"
+  printf 'must survive a newly spawned branch\n' > "$PROJECT_DIR/advanced-main.txt"
+  git -C "$PROJECT_DIR" add advanced-main.txt
+  git -C "$PROJECT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm advance-local-main
+  advanced=$(git -C "$PROJECT_DIR" rev-parse HEAD)
+  [ "$advanced" != "$INITIAL_SHA" ] \
+    || fail "fixture did not prove the local default branch advanced past the pool base"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$INITIAL_SHA" ] \
+    || fail "fixture did not leave the pooled worktree on the older base"
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  expect_code 0 "$status" "spawn should refresh a stale no-remote pool from its local default branch"
+  assert_contains "$out" "spawned $id" "spawn did not report success for a stale no-remote pool"
+  branch_head=$(git -C "$POOL_DIR" rev-parse HEAD)
+  [ "$branch_head" = "$advanced" ] \
+    || fail "spawn left a no-remote pooled worktree on stale local history"
+  assert_grep 'must survive a newly spawned branch' "$POOL_DIR/advanced-main.txt" \
+    "the no-remote spawn started from a base missing the newest local commit"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote refresh: HEAD=%s local-main=%s\n' "$branch_head" "$advanced"
+  fi
+  pass "a stale no-remote pooled worktree refreshes to the local default-branch tip before branching"
 }
 
 # Skipping the fetch must not skip the clean gate: this is the spawn path's only
@@ -515,6 +551,7 @@ test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool
 test_unreachable_origin_refuses_stale_pool_base
 test_no_remote_project_skips_freshen_cleanly
+test_no_remote_stale_pool_refreshes_to_local_default
 test_no_remote_dirty_pool_still_refuses
 test_stale_submodule_pin_explains_itself
 test_unpushed_submodule_commit_is_still_uncommitted_work
