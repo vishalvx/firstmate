@@ -4,8 +4,8 @@
 # A treehouse pool can return a clean detached worktree whose origin/main was
 # advanced after the worktree was allocated.
 # These tests drive the real spawn path with a fake terminal, then prove it
-# starts the worker from the fetched origin/main tip or stops when origin is
-# unreachable.
+# starts the worker from the fetched origin/main tip, skips cleanly when no
+# origin is configured, or stops when origin is unreachable.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -71,6 +71,29 @@ read_case_record() {
   IFS='|' read -r CASE_DIR HOME_DIR PROJECT_DIR POOL_DIR FAKEBIN_DIR INITIAL_SHA DEFAULT_BRANCH <<EOF
 $1
 EOF
+}
+
+make_no_remote_case() {
+  local name=$1 id=$2 default=${3:-main} case_dir home project pool fakebin initial
+  case_dir="$TMP_ROOT/$name"
+  home="$case_dir/home"
+  project="$case_dir/project"
+  pool="$case_dir/pool"
+  fakebin=$(make_spawn_fakebin "$case_dir/fake")
+
+  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
+  printf 'codex\n' > "$home/config/crew-harness"
+  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
+  touch "$home/state/.last-watcher-beat"
+
+  git init --quiet -b "$default" "$project"
+  printf 'base\n' > "$project/README.md"
+  git -C "$project" add README.md
+  git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
+  initial=$(git -C "$project" rev-parse HEAD)
+  git -C "$project" worktree add --quiet --detach "$pool" "$initial"
+
+  printf '%s\n' "$case_dir|$home|$project|$pool|$fakebin|$initial|$default"
 }
 
 run_spawn() {
@@ -225,6 +248,28 @@ test_unresolved_remote_default_refuses_pool() {
     printf '# observed unresolved-default refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
   fi
   pass "an unresolved remote default branch refuses the pooled worktree"
+}
+
+test_no_remote_project_skips_freshen_cleanly() {
+  local rec id out status remotes before after
+  id='pool-no-remote-r6'
+  rec=$(make_no_remote_case no-remote "$id")
+  read_case_record "$rec"
+  remotes=$(git -C "$POOL_DIR" remote -v)
+  [ -z "$remotes" ] || fail "fixture did not prove the pooled worktree has no configured remote"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  expect_code 0 "$status" "spawn should not require an origin for a genuinely local-only project"
+  assert_contains "$out" "spawned $id" "spawn did not report success for a no-remote project"
+  after=$(git -C "$POOL_DIR" rev-parse HEAD)
+  [ "$after" = "$before" ] \
+    || fail "spawn moved a no-remote pooled worktree's history when there was nothing to fetch"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote spawn: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a genuinely local-only project with no configured remote skips the freshen step cleanly"
 }
 
 # A slot left on a stale submodule pin is the field failure this diagnosis exists
@@ -456,6 +501,7 @@ test_direct_pr_and_scout_refresh_before_launch
 test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool
 test_unreachable_origin_refuses_stale_pool_base
+test_no_remote_project_skips_freshen_cleanly
 test_stale_submodule_pin_explains_itself
 test_unpushed_submodule_commit_is_still_uncommitted_work
 test_work_inside_submodule_is_still_uncommitted_work

@@ -136,8 +136,10 @@
 #   git worktree root distinct from the primary project checkout.
 #   Before a fresh ship or scout worker starts, its clean task worktree fetches
 #   origin, resolves the current remote default branch, and resets to its tip.
-#   An unreachable origin, unresolved default branch, or non-clean worktree
-#   refuses the spawn rather than risking a PR based on stale history.
+#   A genuinely local-only project with no configured origin has nothing to
+#   freshen against and launches as-is. An unreachable origin, unresolved
+#   default branch, or non-clean worktree still refuses the spawn rather than
+#   risking a PR based on stale history.
 #   A slot whose only deviation is a stale submodule gitlink is refused by that
 #   same clean check, but is reported as a stale checkout naming each submodule
 #   and both pins; nothing is converged or removed, and no remedy is suggested.
@@ -1795,6 +1797,12 @@ EOF
 
 freshen_spawn_worktree_base() {  # <worktree>
   local worktree=$1 default target expected actual status
+  # A genuinely local-only project has no origin to freshen against at all,
+  # distinct from a configured-but-unreachable origin: only the former is
+  # "nothing to do", the latter must keep refusing below.
+  if ! git -C "$worktree" remote get-url origin >/dev/null 2>&1; then
+    return 0
+  fi
   if ! git -C "$worktree" fetch --quiet origin; then
     echo "error: could not fetch origin for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
     return 1
