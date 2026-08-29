@@ -141,7 +141,8 @@
 #                                   not misread as pending input.
 #          FM_INJECT_CONFIRM_SLEEP  seconds between daemon submit checks
 #                                   (default 0.5)
-#          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES / FM_CRASH_*  log + crash guards
+#          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES  log trimming
+#          FM_CRASH_*               crash-loop AND repeated-wake guards (both)
 #          FM_STATE_OVERRIDE        alternate state dir (testing)
 #          FM_SUPERVISE_DAEMON_WATCH_OVERRIDE  override the watcher executable
 #                                   the restart loop launches (testing only)
@@ -1493,7 +1494,7 @@ fm_super_main() {
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; watch=$WATCH; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
@@ -1541,11 +1542,13 @@ fm_super_main() {
   # restarts with no backoff at all above. That is correct for normal, varied
   # fleet traffic, but a watcher that reports the IDENTICAL reason on every
   # restart (e.g. an unconsumed recovery-marker episode kept alive by ongoing
-  # wake-queue traffic) can repeat hundreds of times a minute with zero
-  # throttling, each one a captain-facing escalation. Track consecutive
-  # occurrences of the same reason separately from crash_times, reusing the
-  # identical threshold/window/backoff shape, so the log wording stays accurate
-  # (this is not a crash) while the throttling behavior matches.
+  # wake-queue traffic) is therefore restarted with no added spacing at all for
+  # as long as the reason persists, re-escalating to the captain on every single
+  # restart (258 consecutive identical escalations were observed in this home's
+  # own away-mode logs). Track consecutive occurrences of the same reason
+  # separately from crash_times, reusing the identical threshold/window/backoff
+  # shape, so the log wording stays accurate (this is not a crash) while the
+  # throttling behavior matches.
   local repeat_times=() repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason=
   record_repeated_wake() {
     local now t
@@ -1614,7 +1617,7 @@ fm_super_main() {
         if ! is_wake_reason "$reason"; then
           log "watcher non-wake stdout, idling: $reason"
           WATCHER_PID=""
-          sleep "${HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
+          sleep "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
           continue
         fi
         log "wake: $reason"

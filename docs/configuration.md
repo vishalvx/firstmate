@@ -799,10 +799,10 @@ FM_INJECT_CONFIRM_RETRIES=3        # daemon Enter-retry attempts after typing a 
 FM_INJECT_CONFIRM_SLEEP=0.5        # seconds between daemon submit checks
 FM_HEARTBEAT_SCAN_SECS=300         # cadence of the catch-all status scan for missed captain verbs
 FM_HOUSEKEEPING_TICK=15            # seconds between batch-flush, stale/pause-recheck, and scan passes
-FM_CRASH_THRESHOLD=10              # watcher crashes allowed inside FM_CRASH_WINDOW before daemon backoff
-FM_CRASH_WINDOW=60                 # seconds in the crash-loop detection window
-FM_CRASH_BACKOFF=60                # seconds to wait after crossing the crash threshold
-FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher crash
+FM_CRASH_THRESHOLD=10              # watcher crashes, or consecutive identical watcher wakes, allowed inside FM_CRASH_WINDOW before daemon backoff; drives both guards
+FM_CRASH_WINDOW=60                 # seconds in the detection window for both the crash-loop and the repeated-wake guard
+FM_CRASH_BACKOFF=60                # seconds to wait after crossing either threshold, crash-loop or repeated-wake
+FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher crash, or after a repeated wake below the threshold
 FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
 # spoken interface and captain inbox; see "Spoken interface and captain inbox" above

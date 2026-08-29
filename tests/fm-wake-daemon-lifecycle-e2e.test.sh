@@ -174,12 +174,13 @@ test_stale_pane_transient_persistent_resume() {
 # A watcher whose recovery-marker episode never gets consumed (see
 # bin/fm-watch.sh's resurface_after_downtime) can report the SAME wake reason
 # on every restart. That exit is not a crash (rc=0, non-empty reason), so
-# without a repeated-wake guard the restart loop applies NO backoff at all and
-# can restart as fast as the OS can fork+exec a trivial script. This drives
-# the REAL fm-supervise-daemon.sh against a trivial scripted watcher
-# (FM_SUPERVISE_DAEMON_WATCH_OVERRIDE) that always reports the identical
-# reason, and asserts the restart count over several seconds stays small (the
-# repeated-wake backoff engaged) instead of racing unboundedly.
+# without a repeated-wake guard the restart loop re-runs it with no added
+# spacing at all, re-escalating on every restart for as long as the reason
+# persists. This drives the REAL fm-supervise-daemon.sh against a trivial
+# scripted watcher (FM_SUPERVISE_DAEMON_WATCH_OVERRIDE) that always reports the
+# identical reason, and asserts the observable throttle: once the repeat
+# threshold is crossed, two consecutive wakes must be spaced by at least
+# FM_CRASH_BACKOFF.
 test_repeated_wake_gets_throttled() {
   local dir fakebin state fake_watch daemon_pid log
   dir=$(make_supercase wd-repeat-throttle)
@@ -197,23 +198,33 @@ SH
   PATH="$fakebin:$PATH" FM_STATE_OVERRIDE="$state" \
     FM_SUPERVISE_DAEMON_WATCH_OVERRIDE="$fake_watch" \
     FM_SUPERVISOR_BACKEND=tmux FM_SUPERVISOR_TARGET=fake:0 FM_FAKE_TMUX_PANE_ALIVE=1 \
-    FM_CRASH_NORMAL_SLEEP=1 FM_CRASH_THRESHOLD=1 FM_CRASH_WINDOW=60 FM_CRASH_BACKOFF=4 \
+    FM_CRASH_NORMAL_SLEEP=1 FM_CRASH_THRESHOLD=1 FM_CRASH_WINDOW=60 FM_CRASH_BACKOFF=8 \
     FM_HOUSEKEEPING_TICK=999999 \
     "$DAEMON" > "$dir/daemon.out" 2> "$dir/daemon.err" &
   daemon_pid=$!
 
-  sleep 12
+  sleep 24
   kill -TERM "$daemon_pid" 2>/dev/null || true
   wait "$daemon_pid" 2>/dev/null || true
 
   [ -f "$log" ] || fail "repeated-wake throttle: daemon produced no log ($(cat "$dir/daemon.err" 2>/dev/null))"
-  local wakes
+  local wakes widest
   wakes=$(grep -c '^\[.*\] wake: check: fake-repeat$' "$log")
-  # No-backoff-at-all would restart as fast as the OS can fork+exec a trivial
-  # script - hundreds of times in 9s. The repeated-wake guard's own backoff
-  # schedule (1s, 1s, then 4s once the threshold trips) bounds it to a handful.
-  [ "$wakes" -ge 2 ] || fail "repeated-wake throttle: expected the fake watcher to restart at least twice, got $wakes ($(cat "$log"))"
-  [ "$wakes" -le 10 ] || fail "repeated-wake throttle: restarted $wakes times in 9s with no observable backoff ($(cat "$log"))"
+  # The unthrottled cadence is NOT a bare fork+exec: every wake also runs the
+  # durable-wake drain, so unpatched restarts land ~2-3s apart and a raw count
+  # over this window barely separates the two behaviors. The gap does: the
+  # widest interval between consecutive wakes is ~3s without the guard, and at
+  # least FM_CRASH_BACKOFF (8s) once the repeat threshold trips. Sleeps only
+  # ever widen gaps, so a loaded machine cannot push this below the bound.
+  [ "$wakes" -ge 3 ] || fail "repeated-wake throttle: expected the fake watcher to restart past the repeat threshold, got $wakes wakes ($(cat "$log"))"
+  [ "$wakes" -le 8 ] || fail "repeated-wake throttle: restarted $wakes times in 24s, at the unthrottled rate ($(cat "$log"))"
+  widest=$(awk -F'T' '/\] wake: check: fake-repeat$/ {
+      split(substr($2, 1, 8), c, ":")
+      now = c[1] * 3600 + c[2] * 60 + c[3]
+      if (seen) { gap = now - prev; if (gap < 0) gap += 86400; if (gap > max) max = gap }
+      prev = now; seen = 1
+    } END { print max + 0 }' "$log")
+  [ "$widest" -ge 8 ] || fail "repeated-wake throttle: widest gap between consecutive wakes was ${widest}s, short of the 8s backoff ($(cat "$log"))"
   grep -q "ERROR: watcher repeated the identical wake" "$log" \
     || fail "repeated-wake throttle: crossing the threshold did not log the escalated backoff ($(cat "$log"))"
   pass "lifecycle: a watcher repeating the identical wake is throttled, not restarted in a tight loop"

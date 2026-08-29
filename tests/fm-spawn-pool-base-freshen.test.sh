@@ -4,8 +4,9 @@
 # A treehouse pool can return a clean detached worktree whose origin/main was
 # advanced after the worktree was allocated.
 # These tests drive the real spawn path with a fake terminal, then prove it
-# starts the worker from the fetched origin/main tip, skips cleanly when no
-# origin is configured, or stops when origin is unreachable.
+# starts the worker from the fetched origin/main tip, skips the fetch (but not
+# the clean check) when no origin is configured, or stops when origin is
+# unreachable.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -34,8 +35,14 @@ SH
   printf '%s\n' "$fakebin"
 }
 
+# <name> <id> [default-branch] [origin-mode]
+# origin-mode `origin` (the default) publishes a bare origin and advances its
+# default branch past the pooled slot; `no-origin` builds the identical home,
+# project, and pool with no remote configured at all, so both fixtures stay one
+# description of a spawn case as that contract changes.
 make_case() {
-  local name=$1 id=$2 default=${3:-main} case_dir home project origin pool publisher fakebin initial
+  local name=$1 id=$2 default=${3:-main} origin_mode=${4:-origin}
+  local case_dir home project origin pool publisher fakebin initial
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   project="$case_dir/project"
@@ -53,16 +60,20 @@ make_case() {
   printf 'base\n' > "$project/README.md"
   git -C "$project" add README.md
   git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
-  git clone --quiet --bare "$project" "$origin"
-  git -C "$project" remote add origin "file://$origin"
+  if [ "$origin_mode" = origin ]; then
+    git clone --quiet --bare "$project" "$origin"
+    git -C "$project" remote add origin "file://$origin"
+  fi
   initial=$(git -C "$project" rev-parse HEAD)
   git -C "$project" worktree add --quiet --detach "$pool" "$initial"
 
-  git clone --quiet "file://$origin" "$publisher"
-  printf 'must survive a newly spawned branch\n' > "$publisher/advanced-main.txt"
-  git -C "$publisher" add advanced-main.txt
-  git -C "$publisher" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm advance-main
-  git -C "$publisher" push --quiet origin "$default"
+  if [ "$origin_mode" = origin ]; then
+    git clone --quiet "file://$origin" "$publisher"
+    printf 'must survive a newly spawned branch\n' > "$publisher/advanced-main.txt"
+    git -C "$publisher" add advanced-main.txt
+    git -C "$publisher" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm advance-main
+    git -C "$publisher" push --quiet origin "$default"
+  fi
 
   printf '%s\n' "$case_dir|$home|$project|$pool|$fakebin|$initial|$default"
 }
@@ -71,29 +82,6 @@ read_case_record() {
   IFS='|' read -r CASE_DIR HOME_DIR PROJECT_DIR POOL_DIR FAKEBIN_DIR INITIAL_SHA DEFAULT_BRANCH <<EOF
 $1
 EOF
-}
-
-make_no_remote_case() {
-  local name=$1 id=$2 default=${3:-main} case_dir home project pool fakebin initial
-  case_dir="$TMP_ROOT/$name"
-  home="$case_dir/home"
-  project="$case_dir/project"
-  pool="$case_dir/pool"
-  fakebin=$(make_spawn_fakebin "$case_dir/fake")
-
-  mkdir -p "$home/data/$id" "$home/projects" "$home/state" "$home/config"
-  printf 'codex\n' > "$home/config/crew-harness"
-  printf 'brief for %s\n' "$id" > "$home/data/$id/brief.md"
-  touch "$home/state/.last-watcher-beat"
-
-  git init --quiet -b "$default" "$project"
-  printf 'base\n' > "$project/README.md"
-  git -C "$project" add README.md
-  git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
-  initial=$(git -C "$project" rev-parse HEAD)
-  git -C "$project" worktree add --quiet --detach "$pool" "$initial"
-
-  printf '%s\n' "$case_dir|$home|$project|$pool|$fakebin|$initial|$default"
 }
 
 run_spawn() {
@@ -253,7 +241,7 @@ test_unresolved_remote_default_refuses_pool() {
 test_no_remote_project_skips_freshen_cleanly() {
   local rec id out status remotes before after
   id='pool-no-remote-r6'
-  rec=$(make_no_remote_case no-remote "$id")
+  rec=$(make_case no-remote "$id" main no-origin)
   read_case_record "$rec"
   remotes=$(git -C "$POOL_DIR" remote -v)
   [ -z "$remotes" ] || fail "fixture did not prove the pooled worktree has no configured remote"
@@ -270,6 +258,31 @@ test_no_remote_project_skips_freshen_cleanly() {
     printf '# observed no-remote spawn: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
   fi
   pass "a genuinely local-only project with no configured remote skips the freshen step cleanly"
+}
+
+# Skipping the fetch must not skip the clean gate: this is the spawn path's only
+# check that a pooled slot came back free of leftover work, so a local-only
+# project has to be held to it too.
+test_no_remote_dirty_pool_still_refuses() {
+  local rec id out status before
+  id='pool-no-remote-dirty-r7'
+  rec=$(make_case no-remote-dirty "$id" main no-origin)
+  read_case_record "$rec"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+  printf 'keep this local work\n' > "$POOL_DIR/uncommitted.txt"
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn succeeded on a dirty pooled worktree just because the project has no origin"
+  assert_contains "$out" "is not clean" "spawn did not clearly refuse a dirty no-remote pooled worktree"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+    || fail "spawn moved HEAD while refusing a dirty no-remote pooled worktree"
+  assert_grep 'keep this local work' "$POOL_DIR/uncommitted.txt" \
+    "spawn discarded uncommitted work while refusing a no-remote pool"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote dirty refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a dirty pooled worktree is still refused when the project has no configured remote"
 }
 
 # A slot left on a stale submodule pin is the field failure this diagnosis exists
@@ -502,6 +515,7 @@ test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool
 test_unreachable_origin_refuses_stale_pool_base
 test_no_remote_project_skips_freshen_cleanly
+test_no_remote_dirty_pool_still_refuses
 test_stale_submodule_pin_explains_itself
 test_unpushed_submodule_commit_is_still_uncommitted_work
 test_work_inside_submodule_is_still_uncommitted_work

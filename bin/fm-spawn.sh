@@ -137,7 +137,8 @@
 #   Before a fresh ship or scout worker starts, its clean task worktree fetches
 #   origin, resolves the current remote default branch, and resets to its tip.
 #   A genuinely local-only project with no configured origin has nothing to
-#   freshen against and launches as-is. An unreachable origin, unresolved
+#   freshen against and launches at its current commit, but still has to pass
+#   the same clean check as every other slot. An unreachable origin, unresolved
 #   default branch, or non-clean worktree still refuses the spawn rather than
 #   risking a PR based on stale history.
 #   A slot whose only deviation is a stale submodule gitlink is refused by that
@@ -1795,12 +1796,29 @@ EOF
   printf '%s' "$lines" >&2
 }
 
+refuse_unclean_spawn_worktree() {  # <worktree>
+  local worktree=$1 status
+  status=$(git -C "$worktree" -c core.quotePath=false status --porcelain) || {
+    echo "error: could not inspect pooled worktree '$worktree' before refreshing its base" >&2
+    return 1
+  }
+  [ -n "$status" ] || return 0
+  if describe_stale_submodule_pins "$worktree" "$status"; then
+    echo "error: pooled worktree '$worktree' has a stale submodule checkout, not uncommitted work; refusing to launch and leaving it untouched" >&2
+  else
+    echo "error: pooled worktree '$worktree' is not clean; refusing to discard uncommitted work while refreshing its base" >&2
+  fi
+  return 1
+}
+
 freshen_spawn_worktree_base() {  # <worktree>
-  local worktree=$1 default target expected actual status
+  local worktree=$1 default target expected actual
   # A genuinely local-only project has no origin to freshen against at all,
   # distinct from a configured-but-unreachable origin: only the former is
-  # "nothing to do", the latter must keep refusing below.
+  # "nothing to do", the latter must keep refusing below. Either way the slot
+  # still has to be clean, because this is the spawn path's only such gate.
   if ! git -C "$worktree" remote get-url origin >/dev/null 2>&1; then
+    refuse_unclean_spawn_worktree "$worktree" || return 1
     return 0
   fi
   if ! git -C "$worktree" fetch --quiet origin; then
@@ -1824,18 +1842,7 @@ freshen_spawn_worktree_base() {  # <worktree>
     echo "error: '$target' is not a commit for pooled worktree '$worktree'; refusing to launch from a potentially stale base" >&2
     return 1
   }
-  status=$(git -C "$worktree" -c core.quotePath=false status --porcelain) || {
-    echo "error: could not inspect pooled worktree '$worktree' before refreshing its base" >&2
-    return 1
-  }
-  if [ -n "$status" ]; then
-    if describe_stale_submodule_pins "$worktree" "$status"; then
-      echo "error: pooled worktree '$worktree' has a stale submodule checkout, not uncommitted work; refusing to launch and leaving it untouched" >&2
-    else
-      echo "error: pooled worktree '$worktree' is not clean; refusing to discard uncommitted work while refreshing its base" >&2
-    fi
-    return 1
-  fi
+  refuse_unclean_spawn_worktree "$worktree" || return 1
   if ! git -C "$worktree" reset --hard "$target" >/dev/null; then
     echo "error: could not reset pooled worktree '$worktree' to '$target'; refusing to launch from a potentially stale base" >&2
     return 1
