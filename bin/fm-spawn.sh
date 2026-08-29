@@ -137,11 +137,12 @@
 #   Before a fresh ship or scout worker starts, its clean task worktree fetches
 #   origin, resolves the current remote default branch, and resets to its tip.
 #   A genuinely local-only project with no configured origin skips only the
-#   remote round trip: it resets to the local default branch of the repository
-#   the slot is a worktree of, and launches where it stands only when no local
-#   default branch resolves. It passes the same clean check as every other slot.
-#   An unreachable origin, unresolved default branch, or non-clean worktree
-#   still refuses the spawn rather than risking a PR based on stale history.
+#   remote round trip: it resets to the local default branch tip of the
+#   repository the slot is a worktree of, and refuses if that local default
+#   branch cannot be resolved. It passes the same clean check as every other
+#   slot. An unreachable origin, unresolved default branch, or non-clean
+#   worktree still refuses the spawn rather than risking a PR based on stale
+#   history.
 #   A slot whose only deviation is a stale submodule gitlink is refused by that
 #   same clean check, but is reported as a stale checkout naming each submodule
 #   and both pins; nothing is converged or removed, and no remedy is suggested.
@@ -1820,28 +1821,24 @@ freshen_spawn_worktree_base() {  # <worktree>
   # is the remote round trip, not base freshness: a pool can hand back a slot
   # allocated several commits ago, and for a local-only project the authoritative
   # tip is simply the local default branch of the very repository this slot is a
-  # worktree of. Reset to that instead, so a local-only worker never branches off
-  # stale history. Only a slot whose local default branch cannot be resolved has
-  # nothing to freshen against and launches where it stands. The clean gate runs
-  # either way, because this is the spawn path's only such gate.
+  # worktree of - the same commit primary_head_commit() already resolves for a
+  # secondmate's local-only sync. Reset to that instead, so a local-only worker
+  # never branches off stale history. If that commit cannot be resolved, refuse
+  # rather than launch from an unverified base - the clean gate runs either way,
+  # because this is the spawn path's only such gate.
   if ! git -C "$worktree" remote get-url origin >/dev/null 2>&1; then
     refuse_unclean_spawn_worktree "$worktree" || return 1
-    default=$(default_branch "$worktree") || {
-      echo "warning: pooled worktree '$worktree' has no origin and no resolvable local default branch; launching from its existing base" >&2
-      return 0
-    }
-    target="refs/heads/$default"
-    expected=$(git -C "$worktree" rev-parse --verify --quiet "$target^{commit}" 2>/dev/null) || {
-      echo "warning: pooled worktree '$worktree' has no origin and no local '$default' commit; launching from its existing base" >&2
-      return 0
+    expected=$(primary_head_commit "$worktree") || {
+      echo "error: pooled worktree '$worktree' has no origin and no resolvable local default branch; refusing to launch from an unverifiable base" >&2
+      return 1
     }
     if ! git -C "$worktree" reset --hard "$expected" >/dev/null; then
-      echo "error: could not reset pooled worktree '$worktree' to local '$default'; refusing to launch from a potentially stale base" >&2
+      echo "error: could not reset pooled worktree '$worktree' to its local default branch tip; refusing to launch from a potentially stale base" >&2
       return 1
     fi
     actual=$(git -C "$worktree" rev-parse --verify --quiet HEAD 2>/dev/null || true)
     if [ "$actual" != "$expected" ]; then
-      echo "error: pooled worktree '$worktree' is at '${actual:-unknown}', not local '$default' ('$expected'); refusing to launch" >&2
+      echo "error: pooled worktree '$worktree' is at '${actual:-unknown}', not its local default branch tip ('$expected'); refusing to launch" >&2
       return 1
     fi
     return 0

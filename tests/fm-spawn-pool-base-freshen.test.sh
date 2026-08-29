@@ -321,6 +321,32 @@ test_no_remote_dirty_pool_still_refuses() {
   pass "a dirty pooled worktree is still refused when the project has no configured remote"
 }
 
+# A no-origin project whose default branch is neither `main` nor `master` gives
+# default_branch() (and so primary_head_commit()) nothing to resolve, since
+# there is no origin/HEAD symref to consult either. The reset target must then
+# be treated as unverifiable and the spawn refused, never launched from
+# whatever commit the slot happens to sit at - that silent-stale-launch is the
+# exact failure this fix exists to prevent.
+test_no_remote_unresolvable_default_refuses_pool() {
+  local rec id out status before
+  id='pool-no-remote-unresolvable-r9'
+  rec=$(make_case no-remote-unresolvable "$id" trunk no-origin)
+  read_case_record "$rec"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn succeeded despite an unresolvable local default branch"
+  assert_contains "$out" "no resolvable local default branch" \
+    "spawn did not clearly refuse an unresolvable local default branch"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+    || fail "spawn moved HEAD despite refusing an unresolvable local default branch"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote unresolvable-default refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a no-remote project with no resolvable local default branch refuses the spawn instead of launching from a stale base"
+}
+
 # A slot left on a stale submodule pin is the field failure this diagnosis exists
 # for: a refresh moved the superproject and left the submodule behind, so the
 # refusal fires a spawn later, on a slot whose own `git status` looks clean to the
@@ -553,6 +579,7 @@ test_unreachable_origin_refuses_stale_pool_base
 test_no_remote_project_skips_freshen_cleanly
 test_no_remote_stale_pool_refreshes_to_local_default
 test_no_remote_dirty_pool_still_refuses
+test_no_remote_unresolvable_default_refuses_pool
 test_stale_submodule_pin_explains_itself
 test_unpushed_submodule_commit_is_still_uncommitted_work
 test_work_inside_submodule_is_still_uncommitted_work

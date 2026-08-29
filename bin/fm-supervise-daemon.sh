@@ -1517,36 +1517,20 @@ fm_super_main() {
   }
   trap cleanup TERM INT
 
-  # --- restart-guard counting ------------------------------------------------
-  # Both guards below count a STREAK: consecutive events whose gaps all stay
-  # under CRASH_WINDOW, where a gap of CRASH_WINDOW or more starts the count
-  # over. Counting how many events landed inside a sliding CRASH_WINDOW cannot
-  # work here, because each guard's own backoff sits inside the loop it is
-  # measuring: a restart costs at least CRASH_NORMAL_SLEEP plus the loop's own
-  # 1s poll, so the observed rate saturates at CRASH_WINDOW /
-  # (CRASH_NORMAL_SLEEP + 1) events per window - exactly CRASH_THRESHOLD at the
-  # shipped 60/5/10 defaults - and the escalated tier can never be crossed. A
-  # streak keeps the property that mattered (an isolated event never
-  # accumulates) and makes that tier reachable.
-  _streak_next() {  # <streak> <last-at> <now>
-    local streak=$1 last=$2 now=$3
-    if [ -z "$last" ] || [ $((now - last)) -ge "$CRASH_WINDOW" ]; then
-      echo 1
-    else
-      echo $((streak + 1))
-    fi
-  }
-
   # --- crash-loop guard -----------------------------------------------------
-  local crash_streak=0 crash_last_at='' backoff_secs=$CRASH_NORMAL_SLEEP
+  local crash_times=() backoff_secs=$CRASH_NORMAL_SLEEP
   record_crash() {
-    local now
+    local now t
     now=$(_now)
-    crash_streak=$(_streak_next "$crash_streak" "$crash_last_at" "$now")
-    crash_last_at=$now
-    if [ "$crash_streak" -gt "$CRASH_THRESHOLD" ]; then
-      log "ERROR: watcher crashed $crash_streak times in a row, never quiet for ${CRASH_WINDOW}s; backing off ${CRASH_BACKOFF}s"
-      crash_streak=0
+    local -a keep=()
+    for t in "${crash_times[@]:-}"; do
+      [ -n "$t" ] && [ $((now - t)) -lt "$CRASH_WINDOW" ] && keep+=("$t")
+    done
+    keep+=("$now")
+    crash_times=("${keep[@]}")
+    if [ "${#crash_times[@]}" -gt "$CRASH_THRESHOLD" ]; then
+      log "ERROR: watcher crashed ${#crash_times[@]} times within ${CRASH_WINDOW}s; backing off ${CRASH_BACKOFF}s"
+      crash_times=()
       backoff_secs=$CRASH_BACKOFF
     else
       backoff_secs=$CRASH_NORMAL_SLEEP
@@ -1561,18 +1545,26 @@ fm_super_main() {
   # wake-queue traffic) is therefore restarted with no added spacing at all for
   # as long as the reason persists, re-escalating to the captain on every single
   # restart (258 consecutive identical escalations were observed in this home's
-  # own away-mode logs). Track consecutive occurrences of the same reason as
-  # their own streak, separate from the crash streak but counted the same way
-  # and against the same threshold/window/backoff, so the log wording stays
-  # accurate (this is not a crash) while the throttling behavior matches.
-  local repeat_streak=0 repeat_last_at='' repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason=
+  # own away-mode logs).
+  #
+  # This counts a plain consecutive STREAK rather than mirroring the crash
+  # guard's sliding CRASH_WINDOW count above, and that divergence is deliberate,
+  # not an oversight. The guard's own backoff sits inside the loop it measures:
+  # a restart costs at least CRASH_NORMAL_SLEEP plus the loop's own 1s poll, so
+  # a sliding-window count saturates at CRASH_WINDOW / (CRASH_NORMAL_SLEEP + 1)
+  # events per window - exactly CRASH_THRESHOLD at the shipped 60/5/10 defaults
+  # - and the escalated backoff tier could never be crossed. Streak counting
+  # works here specifically because the counter already resets to zero on any
+  # differing reason (below), so every tracked occurrence is consecutive by
+  # construction and a time window adds nothing but that dead zone. The
+  # pre-existing crash guard above is left on its sliding-window shape on
+  # purpose: it is a separate, pre-existing, cross-home concern outside this
+  # change's scope, reported upstream separately.
+  local repeat_streak=0 repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason=
   record_repeated_wake() {
-    local now
-    now=$(_now)
-    repeat_streak=$(_streak_next "$repeat_streak" "$repeat_last_at" "$now")
-    repeat_last_at=$now
+    repeat_streak=$((repeat_streak + 1))
     if [ "$repeat_streak" -gt "$CRASH_THRESHOLD" ]; then
-      log "ERROR: watcher repeated the identical wake ('$last_wake_reason') $repeat_streak times in a row, never quiet for ${CRASH_WINDOW}s; backing off ${CRASH_BACKOFF}s"
+      log "ERROR: watcher repeated the identical wake ('$last_wake_reason') $repeat_streak times in a row; backing off ${CRASH_BACKOFF}s"
       repeat_streak=0
       repeat_backoff_secs=$CRASH_BACKOFF
     else
@@ -1642,7 +1634,6 @@ fm_super_main() {
           sleep "$repeat_backoff_secs"
         else
           repeat_streak=0
-          repeat_last_at=''
           repeat_backoff_secs=$CRASH_NORMAL_SLEEP
         fi
         last_wake_reason=$reason
