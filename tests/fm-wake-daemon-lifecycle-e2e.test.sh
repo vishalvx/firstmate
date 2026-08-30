@@ -311,7 +311,47 @@ EOF
   pass "lifecycle: the repeated-wake backoff still fires when restarts are slower than the window allows per event"
 }
 
+# A streak with no rate component at all would trip on healthy, slowly paced
+# repeats of the same reason (e.g. one long-lived task the only thing writing
+# status) that are never actually spinning. record_repeated_wake resets the
+# streak whenever the gap since the previous repeat exceeds FM_CRASH_WINDOW, so
+# this drives restarts deliberately slower than that window and asserts the
+# guard never trips, no matter how many such repeats accumulate.
+test_repeat_backoff_never_trips_on_slow_healthy_repeats() {
+  local rec dir log daemon_pid deadline wakes
+  rec=$(start_repeat_wake_daemon wd-repeat-slow-healthy \
+    FM_CRASH_NORMAL_SLEEP=3 FM_CRASH_THRESHOLD=2 FM_CRASH_WINDOW=2 FM_CRASH_BACKOFF=10)
+  IFS='|' read -r dir log daemon_pid <<EOF
+$rec
+EOF
+
+  # Each restart costs at least FM_CRASH_NORMAL_SLEEP (3s) plus the loop's own
+  # 1s poll, so every repeat lands >2s (FM_CRASH_WINDOW) after the previous one
+  # and the streak resets to 1 every time - it can never exceed
+  # FM_CRASH_THRESHOLD (2) no matter how long this runs. Wait for several times
+  # the threshold's worth of wakes before concluding the guard stayed quiet.
+  wakes=0
+  deadline=$(( $(date +%s) + 60 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ -f "$log" ]; then
+      wakes=$(grep -c '^\[.*\] wake: check: fake-repeat$' "$log")
+      [ "$wakes" -ge 6 ] && break
+    fi
+    sleep 1
+  done
+  kill -TERM "$daemon_pid" 2>/dev/null || true
+  wait_for_exit "$daemon_pid" 50 2>/dev/null || true
+
+  [ -f "$log" ] || fail "slow healthy repeats: daemon produced no log ($(cat "$dir/daemon.err" 2>/dev/null))"
+  [ "$wakes" -ge 6 ] \
+    || fail "slow healthy repeats: expected at least 6 identical-reason wakes to accumulate, got $wakes ($(cat "$log"))"
+  grep -q "ERROR: watcher repeated the identical wake" "$log" \
+    && fail "slow healthy repeats: the guard tripped on repeats spaced past FM_CRASH_WINDOW, which should never accumulate a streak ($(cat "$log"))"
+  pass "lifecycle: the repeated-wake backoff never trips on healthy repeats spaced slower than the detection window"
+}
+
 test_routine_then_terminal_after_restart
 test_stale_pane_transient_persistent_resume
 test_repeated_wake_gets_throttled
 test_repeat_backoff_reachable_when_restarts_outpace_the_window
+test_repeat_backoff_never_trips_on_slow_healthy_repeats
