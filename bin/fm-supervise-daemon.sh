@@ -62,8 +62,9 @@
 #
 # The robustness shell from the prior always-inject version is preserved:
 # single-instance lock (portable helper, no flock dependency), crash-loop
-# backoff, pane-gone guard, and a signal-trapped shutdown that flushes buffered
-# escalations before exit.
+# backoff, a repeated-wake backoff for a watcher that keeps reporting the
+# identical non-crash reason, pane-gone guard, and a signal-trapped shutdown
+# that flushes buffered escalations before exit.
 #
 # Usage: fm-supervise-daemon.sh
 #          Long-lived background loop. Normally started by the /afk skill, which
@@ -140,13 +141,19 @@
 #                                   not misread as pending input.
 #          FM_INJECT_CONFIRM_SLEEP  seconds between daemon submit checks
 #                                   (default 0.5)
-#          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES / FM_CRASH_*  log + crash guards
+#          FM_LOG_MAX_BYTES / FM_LOG_KEEP_LINES  log trimming
+#          FM_CRASH_*               crash-loop AND repeated-wake guards (both)
 #          FM_STATE_OVERRIDE        alternate state dir (testing)
+#          FM_SUPERVISE_DAEMON_WATCH_OVERRIDE  override the watcher executable
+#                                   the restart loop launches (testing only)
 #          Logs each wake to state/.supervise-daemon.log (size-capped). Single
 #          instance via portable lock on state/.supervise-daemon.lock. Trapped
 #          SIGTERM/SIGINT shut down within ~1s, flush escalations, release the
 #          lock. A crashing fm-watch.sh is logged and restarted, never killing
-#          the daemon; a tight crash-restart spin is detected and backed off.
+#          the daemon; a tight crash-restart spin is detected and backed off,
+#          and a watcher that keeps exiting with the identical valid wake
+#          reason is throttled on the same schedule instead of restarting with
+#          no backoff at all.
 set -u
 
 FM_DAEMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -1383,7 +1390,10 @@ fm_super_main() {
   # shellcheck source=bin/fm-wake-lib.sh
   FM_STATE_OVERRIDE="$STATE" . "$FM_DAEMON_DIR/fm-wake-lib.sh"
 
-  local WATCH="$FM_DAEMON_DIR/fm-watch.sh"
+  # Override only for tests: lets a test drive the restart loop's own timing
+  # and backoff logic against a trivial scripted watcher, without needing a
+  # real herdr/tmux session to force a specific wake sequence deterministically.
+  local WATCH="${FM_SUPERVISE_DAEMON_WATCH_OVERRIDE:-$FM_DAEMON_DIR/fm-watch.sh}"
   local LOG="$STATE/.supervise-daemon.log"
   local WATCH_ERR="$STATE/.supervise-daemon.watcher.err"
   local LOCK="$STATE/.supervise-daemon.lock"
@@ -1484,7 +1494,7 @@ fm_super_main() {
 
   local afk_status="off"
   afk_active "$STATE" && afk_status="on"
-  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
+  log "daemon starting (pid $$); target=$TARGET; target_source=$target_source; backend=$BACKEND; backend_source=$backend_source; afk=$afk_status; watch=$WATCH; inject_skip='${FM_INJECT_SKIP:-$INJECT_SKIP_DEFAULT}'; stale_escalate=${FM_STALE_ESCALATE_SECS:-$STALE_ESCALATE_SECS_DEFAULT}s; batch=${FM_ESCALATE_BATCH_SECS:-$ESCALATE_BATCH_SECS_DEFAULT}s"
   migrate_watcher_pause_markers "$STATE"
 
   # --- shutdown: flush buffered escalations, reap child, release lock -------
@@ -1527,6 +1537,52 @@ fm_super_main() {
     fi
   }
 
+  # --- repeated-wake guard ---------------------------------------------------
+  # A watcher that exits cleanly (rc=0, non-empty reason) is not a crash, so it
+  # restarts with no backoff at all above. That is correct for normal, varied
+  # fleet traffic, but a watcher that reports the IDENTICAL reason on every
+  # restart (e.g. an unconsumed recovery-marker episode kept alive by ongoing
+  # wake-queue traffic) is therefore restarted with no added spacing at all for
+  # as long as the reason persists, re-escalating to the captain on every single
+  # restart (258 consecutive identical escalations were observed in this home's
+  # own away-mode logs).
+  #
+  # This counts a plain consecutive STREAK rather than mirroring the crash
+  # guard's sliding CRASH_WINDOW count above, and that divergence is deliberate,
+  # not an oversight. The guard's own backoff sits inside the loop it measures:
+  # a restart costs at least CRASH_NORMAL_SLEEP plus the loop's own 1s poll, so
+  # a sliding-window count saturates at CRASH_WINDOW / (CRASH_NORMAL_SLEEP + 1)
+  # events per window - exactly CRASH_THRESHOLD at the shipped 60/5/10 defaults
+  # - and the escalated backoff tier could never be crossed. Streak counting
+  # works here specifically because the counter already resets to zero on any
+  # differing reason (below); the pre-existing crash guard above is left on its
+  # sliding-window shape on purpose: it is a separate, pre-existing, cross-home
+  # concern outside this change's scope, reported upstream separately.
+  #
+  # A streak with no rate component at all would also trip on healthy, slowly
+  # paced repeats of the same reason (one long-lived task the only thing
+  # writing status) that are never actually spinning, so record_repeated_wake
+  # also resets the streak whenever the gap since the previous repeat exceeds
+  # CRASH_WINDOW - the threshold stays a streak, not a census, but a repeat far
+  # enough apart to be ordinary traffic can no longer accumulate toward it.
+  local repeat_streak=0 repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason='' last_repeat_at=0
+  record_repeated_wake() {
+    local now
+    now=$(_now)
+    if [ "$repeat_streak" -gt 0 ] && [ $((now - last_repeat_at)) -gt "$CRASH_WINDOW" ]; then
+      repeat_streak=0
+    fi
+    repeat_streak=$((repeat_streak + 1))
+    last_repeat_at=$now
+    if [ "$repeat_streak" -gt "$CRASH_THRESHOLD" ]; then
+      log "ERROR: watcher repeated the identical wake ('$last_wake_reason') $repeat_streak times in a row; backing off ${CRASH_BACKOFF}s"
+      repeat_streak=0
+      repeat_backoff_secs=$CRASH_BACKOFF
+    else
+      repeat_backoff_secs=$CRASH_NORMAL_SLEEP
+    fi
+  }
+
   start_watcher() {
     CUR_TMP=$(mktemp "${TMPDIR:-/tmp}/fm-watch.XXXXXX") || { log "error: mktemp failed; retrying in 5s"; sleep 5; return 1; }
     "$WATCH" >"$CUR_TMP" 2>>"$WATCH_ERR" &
@@ -1562,10 +1618,10 @@ fm_super_main() {
           rm -f "${CUR_TMP}" 2>/dev/null || true
         fi
         CUR_TMP=""
+        WATCHER_PID=""
         if [ "$rc" -ne 0 ] || [ -z "$reason" ]; then
           record_crash
           log "watcher exited rc=$rc reason='$reason'; restarting after ${backoff_secs}s"
-          WATCHER_PID=""
           sleep "$backoff_secs"
           continue
         fi
@@ -1575,8 +1631,7 @@ fm_super_main() {
         # skipped (rc=0, this is normal idle, not a crash).
         if ! is_wake_reason "$reason"; then
           log "watcher non-wake stdout, idling: $reason"
-          WATCHER_PID=""
-          sleep "${HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
+          sleep "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
           continue
         fi
         log "wake: $reason"
@@ -1584,6 +1639,14 @@ fm_super_main() {
           log "durable wake handling was not acknowledged; restarting for recovery"
         fi
         trim_log
+        if [ "$reason" = "$last_wake_reason" ]; then
+          record_repeated_wake
+          sleep "$repeat_backoff_secs"
+        else
+          repeat_streak=0
+          repeat_backoff_secs=$CRASH_NORMAL_SLEEP
+        fi
+        last_wake_reason=$reason
       fi
       start_watcher || continue
     fi

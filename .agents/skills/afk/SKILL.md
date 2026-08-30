@@ -233,8 +233,9 @@ These properties must hold:
 - Declared external waits are rechecked on a separate, bounded cadence rather than being mislabeled as wedges.
 - The catch-all scan backs up the keyword classifier.
 - The daemon preserves a single-instance portable lock, crash-loop backoff,
-  a pane-gone guard, and a signal-trapped shutdown that flushes buffered
-  escalations before exit.
+  a repeated-wake backoff for a watcher that keeps reporting the identical
+  non-crash reason, a pane-gone guard, and a signal-trapped shutdown that
+  flushes buffered escalations before exit.
 
 `FM_INJECT_SKIP` (default `heartbeat`) force-self-handles matching kinds,
 overriding classification.

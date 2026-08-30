@@ -4,8 +4,9 @@
 # A treehouse pool can return a clean detached worktree whose origin/main was
 # advanced after the worktree was allocated.
 # These tests drive the real spawn path with a fake terminal, then prove it
-# starts the worker from the fetched origin/main tip or stops when origin is
-# unreachable.
+# starts the worker from the fetched origin/main tip, falls back to the local
+# default-branch tip (skipping only the remote round trip, never the clean
+# check) when no origin is configured, or stops when origin is unreachable.
 set -u
 
 # shellcheck source=tests/lib.sh
@@ -34,8 +35,14 @@ SH
   printf '%s\n' "$fakebin"
 }
 
+# <name> <id> [default-branch] [origin-mode]
+# origin-mode `origin` (the default) publishes a bare origin and advances its
+# default branch past the pooled slot; `no-origin` builds the identical home,
+# project, and pool with no remote configured at all, so both fixtures stay one
+# description of a spawn case as that contract changes.
 make_case() {
-  local name=$1 id=$2 default=${3:-main} case_dir home project origin pool publisher fakebin initial
+  local name=$1 id=$2 default=${3:-main} origin_mode=${4:-origin}
+  local case_dir home project origin pool publisher fakebin initial
   case_dir="$TMP_ROOT/$name"
   home="$case_dir/home"
   project="$case_dir/project"
@@ -53,16 +60,20 @@ make_case() {
   printf 'base\n' > "$project/README.md"
   git -C "$project" add README.md
   git -C "$project" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm initial
-  git clone --quiet --bare "$project" "$origin"
-  git -C "$project" remote add origin "file://$origin"
+  if [ "$origin_mode" = origin ]; then
+    git clone --quiet --bare "$project" "$origin"
+    git -C "$project" remote add origin "file://$origin"
+  fi
   initial=$(git -C "$project" rev-parse HEAD)
   git -C "$project" worktree add --quiet --detach "$pool" "$initial"
 
-  git clone --quiet "file://$origin" "$publisher"
-  printf 'must survive a newly spawned branch\n' > "$publisher/advanced-main.txt"
-  git -C "$publisher" add advanced-main.txt
-  git -C "$publisher" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm advance-main
-  git -C "$publisher" push --quiet origin "$default"
+  if [ "$origin_mode" = origin ]; then
+    git clone --quiet "file://$origin" "$publisher"
+    printf 'must survive a newly spawned branch\n' > "$publisher/advanced-main.txt"
+    git -C "$publisher" add advanced-main.txt
+    git -C "$publisher" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' commit -qm advance-main
+    git -C "$publisher" push --quiet origin "$default"
+  fi
 
   printf '%s\n' "$case_dir|$home|$project|$pool|$fakebin|$initial|$default"
 }
@@ -225,6 +236,145 @@ test_unresolved_remote_default_refuses_pool() {
     printf '# observed unresolved-default refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
   fi
   pass "an unresolved remote default branch refuses the pooled worktree"
+}
+
+test_no_remote_project_skips_freshen_cleanly() {
+  local rec id out status remotes before after
+  id='pool-no-remote-r6'
+  rec=$(make_case no-remote "$id" main no-origin)
+  read_case_record "$rec"
+  remotes=$(git -C "$POOL_DIR" remote -v)
+  [ -z "$remotes" ] || fail "fixture did not prove the pooled worktree has no configured remote"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  expect_code 0 "$status" "spawn should not require an origin for a genuinely local-only project"
+  assert_contains "$out" "spawned $id" "spawn did not report success for a no-remote project"
+  after=$(git -C "$POOL_DIR" rev-parse HEAD)
+  [ "$after" = "$before" ] \
+    || fail "spawn moved a no-remote pooled worktree's history when there was nothing to fetch"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote spawn: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a genuinely local-only project with no configured remote skips the freshen step cleanly"
+}
+
+# Skipping the fetch must not skip base freshness either. A pool can hand back a
+# slot allocated several commits ago, and for a local-only project the
+# authoritative tip is simply the local default branch of the repository the slot
+# is a worktree of - reachable with no remote at all. A worker that branched off
+# the slot's old commit would merge back from stale history, which is the exact
+# failure the origin path's refusals exist to prevent.
+test_no_remote_stale_pool_refreshes_to_local_default() {
+  local rec id out status advanced branch_head
+  id='pool-no-remote-stale-r8'
+  rec=$(make_case no-remote-stale "$id" main no-origin)
+  read_case_record "$rec"
+  printf 'must survive a newly spawned branch\n' > "$PROJECT_DIR/advanced-main.txt"
+  git -C "$PROJECT_DIR" add advanced-main.txt
+  git -C "$PROJECT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm advance-local-main
+  advanced=$(git -C "$PROJECT_DIR" rev-parse HEAD)
+  [ "$advanced" != "$INITIAL_SHA" ] \
+    || fail "fixture did not prove the local default branch advanced past the pool base"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$INITIAL_SHA" ] \
+    || fail "fixture did not leave the pooled worktree on the older base"
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  expect_code 0 "$status" "spawn should refresh a stale no-remote pool from its local default branch"
+  assert_contains "$out" "spawned $id" "spawn did not report success for a stale no-remote pool"
+  branch_head=$(git -C "$POOL_DIR" rev-parse HEAD)
+  [ "$branch_head" = "$advanced" ] \
+    || fail "spawn left a no-remote pooled worktree on stale local history"
+  assert_grep 'must survive a newly spawned branch' "$POOL_DIR/advanced-main.txt" \
+    "the no-remote spawn started from a base missing the newest local commit"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote refresh: HEAD=%s local-main=%s\n' "$branch_head" "$advanced"
+  fi
+  pass "a stale no-remote pooled worktree refreshes to the local default-branch tip before branching"
+}
+
+# Skipping the fetch must not skip the clean gate: this is the spawn path's only
+# check that a pooled slot came back free of leftover work, so a local-only
+# project has to be held to it too.
+test_no_remote_dirty_pool_still_refuses() {
+  local rec id out status before
+  id='pool-no-remote-dirty-r7'
+  rec=$(make_case no-remote-dirty "$id" main no-origin)
+  read_case_record "$rec"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+  printf 'keep this local work\n' > "$POOL_DIR/uncommitted.txt"
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn succeeded on a dirty pooled worktree just because the project has no origin"
+  assert_contains "$out" "is not clean" "spawn did not clearly refuse a dirty no-remote pooled worktree"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+    || fail "spawn moved HEAD while refusing a dirty no-remote pooled worktree"
+  assert_grep 'keep this local work' "$POOL_DIR/uncommitted.txt" \
+    "spawn discarded uncommitted work while refusing a no-remote pool"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote dirty refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a dirty pooled worktree is still refused when the project has no configured remote"
+}
+
+# A no-origin project whose default branch is neither `main` nor `master` gives
+# default_branch() (and so primary_head_commit()) nothing to resolve, since
+# there is no origin/HEAD symref to consult either. The reset target must then
+# be treated as unverifiable and the spawn refused, never launched from
+# whatever commit the slot happens to sit at - that silent-stale-launch is the
+# exact failure this fix exists to prevent.
+test_no_remote_unresolvable_default_refuses_pool() {
+  local rec id out status before
+  id='pool-no-remote-unresolvable-r9'
+  rec=$(make_case no-remote-unresolvable "$id" trunk no-origin)
+  read_case_record "$rec"
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn succeeded despite an unresolvable local default branch"
+  assert_contains "$out" "no resolvable local default branch" \
+    "spawn did not clearly refuse an unresolvable local default branch"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+    || fail "spawn moved HEAD despite refusing an unresolvable local default branch"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed no-remote unresolvable-default refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a no-remote project with no resolvable local default branch refuses the spawn instead of launching from a stale base"
+}
+
+# A no-origin project whose real default branch is `master` but which also
+# carries a leftover local `main` branch gives default_branch() two candidates
+# and no origin/HEAD symref to choose between them; its main-before-master
+# guess would otherwise silently reset the slot to the wrong branch's tip. The
+# spawn must refuse rather than guess.
+test_no_remote_ambiguous_default_refuses_pool() {
+  local rec id out status before
+  id='pool-no-remote-ambiguous-r12'
+  rec=$(make_case no-remote-ambiguous "$id" master no-origin)
+  read_case_record "$rec"
+  git -C "$PROJECT_DIR" branch --quiet main "$INITIAL_SHA"
+  printf 'must not be silently adopted\n' > "$PROJECT_DIR/master-only.txt"
+  git -C "$PROJECT_DIR" add master-only.txt
+  git -C "$PROJECT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm advance-master
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn succeeded despite an ambiguous local main/master default with no origin to disambiguate"
+  assert_contains "$out" "nothing to disambiguate the default" \
+    "spawn did not clearly refuse an ambiguous local default branch"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+    || fail "spawn moved HEAD despite refusing an ambiguous local default branch"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed ambiguous-default refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a no-remote project with both local main and master branches refuses the spawn instead of guessing the default"
 }
 
 # A slot left on a stale submodule pin is the field failure this diagnosis exists
@@ -456,6 +606,11 @@ test_direct_pr_and_scout_refresh_before_launch
 test_dirty_pool_refuses_without_discarding_work
 test_unresolved_remote_default_refuses_pool
 test_unreachable_origin_refuses_stale_pool_base
+test_no_remote_project_skips_freshen_cleanly
+test_no_remote_stale_pool_refreshes_to_local_default
+test_no_remote_dirty_pool_still_refuses
+test_no_remote_unresolvable_default_refuses_pool
+test_no_remote_ambiguous_default_refuses_pool
 test_stale_submodule_pin_explains_itself
 test_unpushed_submodule_commit_is_still_uncommitted_work
 test_work_inside_submodule_is_still_uncommitted_work

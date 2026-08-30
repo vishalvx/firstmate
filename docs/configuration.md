@@ -785,6 +785,7 @@ FM_SEND_SLEEP=0.4       # seconds between fm-send typed-plane submit checks
 FM_SEND_SETTLE=1        # seconds fm-send waits after a successful typed-plane submit; 0 disables
 FM_PENDING_REPLY_GRACE_SECS=120   # seconds after marked-request delivery before a completed turn without a correlated parent report is eligible for its one recovery repost
 # sub-supervisor (bin/fm-supervise-daemon.sh); presence-gated via /afk
+FM_SUPERVISE_DAEMON_WATCH_OVERRIDE=  # override the watcher executable the daemon's restart loop launches, mainly for tests
 FM_SUPERVISOR_BACKEND=             # optional supervisor pane backend override; tmux/herdr only, otherwise detects $TMUX_PANE then HERDR_ENV/HERDR_PANE_ID before tmux fallback
 FM_SUPERVISOR_TARGET=              # optional supervisor pane target override; tmux target or herdr <session>:<pane-id>, otherwise auto-detected
 FM_INJECT_SKIP=heartbeat           # |-prefixes force-self-handled bypassing classification; empty disables
@@ -798,10 +799,10 @@ FM_INJECT_CONFIRM_RETRIES=3        # daemon Enter-retry attempts after typing a 
 FM_INJECT_CONFIRM_SLEEP=0.5        # seconds between daemon submit checks
 FM_HEARTBEAT_SCAN_SECS=300         # cadence of the catch-all status scan for missed captain verbs
 FM_HOUSEKEEPING_TICK=15            # seconds between batch-flush, stale/pause-recheck, and scan passes
-FM_CRASH_THRESHOLD=10              # watcher crashes allowed inside FM_CRASH_WINDOW before daemon backoff
-FM_CRASH_WINDOW=60                 # seconds in the crash-loop detection window
-FM_CRASH_BACKOFF=60                # seconds to wait after crossing the crash threshold
-FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher crash
+FM_CRASH_THRESHOLD=10              # watcher crashes inside FM_CRASH_WINDOW, or consecutive identical watcher wakes, allowed before daemon backoff; drives both guards
+FM_CRASH_WINDOW=60                 # seconds in the crash-loop guard's sliding detection window; also the max gap since the last repeat before the repeated-wake guard's consecutive streak resets
+FM_CRASH_BACKOFF=60                # seconds to wait after crossing either threshold, crash-loop or repeated-wake
+FM_CRASH_NORMAL_SLEEP=5            # seconds to wait after an isolated watcher crash, or after a repeated wake below the threshold
 FM_LOG_MAX_BYTES=1048576           # daemon log size that triggers trimming
 FM_LOG_KEEP_LINES=2000             # daemon log lines kept when trimming
 # spoken interface and captain inbox; see "Spoken interface and captain inbox" above
