@@ -1555,14 +1555,25 @@ fm_super_main() {
   # events per window - exactly CRASH_THRESHOLD at the shipped 60/5/10 defaults
   # - and the escalated backoff tier could never be crossed. Streak counting
   # works here specifically because the counter already resets to zero on any
-  # differing reason (below), so every tracked occurrence is consecutive by
-  # construction and a time window adds nothing but that dead zone. The
-  # pre-existing crash guard above is left on its sliding-window shape on
-  # purpose: it is a separate, pre-existing, cross-home concern outside this
-  # change's scope, reported upstream separately.
-  local repeat_streak=0 repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason=
+  # differing reason (below); the pre-existing crash guard above is left on its
+  # sliding-window shape on purpose: it is a separate, pre-existing, cross-home
+  # concern outside this change's scope, reported upstream separately.
+  #
+  # A streak with no rate component at all would also trip on healthy, slowly
+  # paced repeats of the same reason (one long-lived task the only thing
+  # writing status) that are never actually spinning, so record_repeated_wake
+  # also resets the streak whenever the gap since the previous repeat exceeds
+  # CRASH_WINDOW - the threshold stays a streak, not a census, but a repeat far
+  # enough apart to be ordinary traffic can no longer accumulate toward it.
+  local repeat_streak=0 repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason= last_repeat_at=0
   record_repeated_wake() {
+    local now
+    now=$(_now)
+    if [ "$repeat_streak" -gt 0 ] && [ $((now - last_repeat_at)) -gt "$CRASH_WINDOW" ]; then
+      repeat_streak=0
+    fi
     repeat_streak=$((repeat_streak + 1))
+    last_repeat_at=$now
     if [ "$repeat_streak" -gt "$CRASH_THRESHOLD" ]; then
       log "ERROR: watcher repeated the identical wake ('$last_wake_reason') $repeat_streak times in a row; backing off ${CRASH_BACKOFF}s"
       repeat_streak=0
@@ -1607,10 +1618,10 @@ fm_super_main() {
           rm -f "${CUR_TMP}" 2>/dev/null || true
         fi
         CUR_TMP=""
+        WATCHER_PID=""
         if [ "$rc" -ne 0 ] || [ -z "$reason" ]; then
           record_crash
           log "watcher exited rc=$rc reason='$reason'; restarting after ${backoff_secs}s"
-          WATCHER_PID=""
           sleep "$backoff_secs"
           continue
         fi
@@ -1620,7 +1631,6 @@ fm_super_main() {
         # skipped (rc=0, this is normal idle, not a crash).
         if ! is_wake_reason "$reason"; then
           log "watcher non-wake stdout, idling: $reason"
-          WATCHER_PID=""
           sleep "${FM_HOUSEKEEPING_TICK:-$HOUSEKEEPING_TICK_DEFAULT}"
           continue
         fi

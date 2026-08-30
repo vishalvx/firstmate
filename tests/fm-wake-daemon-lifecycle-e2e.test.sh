@@ -245,7 +245,7 @@ EOF
     sleep 1
   done
   kill -TERM "$daemon_pid" 2>/dev/null || true
-  wait "$daemon_pid" 2>/dev/null || true
+  wait_for_exit "$daemon_pid" 50 2>/dev/null || true
 
   [ -f "$log" ] || fail "repeated-wake throttle: daemon produced no log ($(cat "$dir/daemon.err" 2>/dev/null))"
   # The unthrottled cadence is NOT a bare fork+exec: every wake also runs the
@@ -292,7 +292,7 @@ EOF
     sleep 1
   done
   kill -TERM "$daemon_pid" 2>/dev/null || true
-  wait "$daemon_pid" 2>/dev/null || true
+  wait_for_exit "$daemon_pid" 50 2>/dev/null || true
 
   [ -f "$log" ] || fail "slow repeat backoff: daemon produced no log ($(cat "$dir/daemon.err" 2>/dev/null))"
   grep -q "ERROR: watcher repeated the identical wake" "$log" \

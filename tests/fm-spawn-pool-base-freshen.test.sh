@@ -347,6 +347,36 @@ test_no_remote_unresolvable_default_refuses_pool() {
   pass "a no-remote project with no resolvable local default branch refuses the spawn instead of launching from a stale base"
 }
 
+# A no-origin project whose real default branch is `master` but which also
+# carries a leftover local `main` branch gives default_branch() two candidates
+# and no origin/HEAD symref to choose between them; its main-before-master
+# guess would otherwise silently reset the slot to the wrong branch's tip. The
+# spawn must refuse rather than guess.
+test_no_remote_ambiguous_default_refuses_pool() {
+  local rec id out status before
+  id='pool-no-remote-ambiguous-r12'
+  rec=$(make_case no-remote-ambiguous "$id" master no-origin)
+  read_case_record "$rec"
+  git -C "$PROJECT_DIR" branch --quiet main "$INITIAL_SHA"
+  printf 'must not be silently adopted\n' > "$PROJECT_DIR/master-only.txt"
+  git -C "$PROJECT_DIR" add master-only.txt
+  git -C "$PROJECT_DIR" -c user.name='Firstmate Tests' -c user.email='tests@example.invalid' \
+    commit -qm advance-master
+  before=$(git -C "$POOL_DIR" rev-parse HEAD)
+
+  out=$(run_spawn "$id" --mode local-only --yolo off)
+  status=$?
+  [ "$status" -ne 0 ] || fail "spawn succeeded despite an ambiguous local main/master default with no origin to disambiguate"
+  assert_contains "$out" "nothing to disambiguate the default" \
+    "spawn did not clearly refuse an ambiguous local default branch"
+  [ "$(git -C "$POOL_DIR" rev-parse HEAD)" = "$before" ] \
+    || fail "spawn moved HEAD despite refusing an ambiguous local default branch"
+  if [ "${FM_TEST_EVIDENCE:-0}" = 1 ]; then
+    printf '# observed ambiguous-default refusal: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"
+  fi
+  pass "a no-remote project with both local main and master branches refuses the spawn instead of guessing the default"
+}
+
 # A slot left on a stale submodule pin is the field failure this diagnosis exists
 # for: a refresh moved the superproject and left the submodule behind, so the
 # refusal fires a spawn later, on a slot whose own `git status` looks clean to the
@@ -580,6 +610,7 @@ test_no_remote_project_skips_freshen_cleanly
 test_no_remote_stale_pool_refreshes_to_local_default
 test_no_remote_dirty_pool_still_refuses
 test_no_remote_unresolvable_default_refuses_pool
+test_no_remote_ambiguous_default_refuses_pool
 test_stale_submodule_pin_explains_itself
 test_unpushed_submodule_commit_is_still_uncommitted_work
 test_work_inside_submodule_is_still_uncommitted_work

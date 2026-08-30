@@ -1828,6 +1828,12 @@ freshen_spawn_worktree_base() {  # <worktree>
   # because this is the spawn path's only such gate.
   if ! git -C "$worktree" remote get-url origin >/dev/null 2>&1; then
     refuse_unclean_spawn_worktree "$worktree" || return 1
+    if ! git -C "$worktree" symbolic-ref --quiet --short refs/remotes/origin/HEAD >/dev/null 2>&1 &&
+       git -C "$worktree" show-ref --verify --quiet refs/heads/main &&
+       git -C "$worktree" show-ref --verify --quiet refs/heads/master; then
+      echo "error: pooled worktree '$worktree' has no origin and both 'main' and 'master' local branches exist with nothing to disambiguate the default; refusing to guess which one is the true default" >&2
+      return 1
+    fi
     expected=$(primary_head_commit "$worktree") || {
       echo "error: pooled worktree '$worktree' has no origin and no resolvable local default branch; refusing to launch from an unverifiable base" >&2
       return 1
