@@ -1565,7 +1565,7 @@ fm_super_main() {
   # also resets the streak whenever the gap since the previous repeat exceeds
   # CRASH_WINDOW - the threshold stays a streak, not a census, but a repeat far
   # enough apart to be ordinary traffic can no longer accumulate toward it.
-  local repeat_streak=0 repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason= last_repeat_at=0
+  local repeat_streak=0 repeat_backoff_secs=$CRASH_NORMAL_SLEEP last_wake_reason='' last_repeat_at=0
   record_repeated_wake() {
     local now
     now=$(_now)
